@@ -1,0 +1,1062 @@
+---
+title: "Artificial Intelligence untuk Nowcasting"
+format:
+  html:
+    toc: true
+---
+
+## Package
+
+```{r}
+#|output: false
+library(tidyverse)
+library(readxl)
+library(timetk)
+library(skimr)
+library(torch)
+```
+
+```{r}
+df <- read_excel("Data_PDRB_siap.xlsx")
+glimpse(df)
+```
+
+```{r}
+skim_without_charts(df)
+```
+
+
+```{r}
+df <- mutate(df,date = ymd(date))
+glimpse(df)
+```
+
+## Grafik Time Series
+
+
+```{r}
+plot_time_series(.data=na.omit(df),
+                 .date_var = date,
+                 .value = ADHK,
+                 .interactive = TRUE,
+                 .title =  "ADHK",
+                 .smooth = FALSE)
+```
+
+fungsi pembantu
+
+```{r}
+multi_plot_time_series <- function(data,date,exclude_var=NULL,.interactive=TRUE,n_col=2,n_row=2,.title="Multiple Time Series"){
+data %>% 
+  select(-all_of(exclude_var)) %>% 
+  select(all_of(date),where(is.numeric)) %>% 
+  pivot_longer(cols = -all_of(date),
+               names_to = "variable",
+               values_to = "value") %>% 
+  group_by(variable) %>% 
+    plot_time_series(.data=,
+                 .date_var = date,
+                 .value = value,
+                 .interactive = .interactive,
+                 .title =  .title,
+                 .facet_ncol = n_col,
+                 .facet_nrow = n_row,
+                 .smooth = FALSE)
+}  
+
+```
+
+```{r}
+multi_plot_time_series(df,
+                       date = "date",
+                       exclude_var = "ADHK",
+                       .interactive=FALSE,
+                       n_col = 2)
+```
+
+## Grafik Time Series Differencing
+
+```{r}
+tk_augment_differences(.data=na.omit(df),
+                        .value = ADHK,
+                        .differences = 1) %>% 
+  plot_time_series(.date_var = date,
+                   .value = ADHK_lag1_diff1,
+                   .interactive = TRUE,
+                   .title =  "ADHK",
+                   .smooth = FALSE)
+```
+
+## Multi Input Multi Output (MIMO)
+
+### Fungsi pembantu
+
+```{r}
+#| code-fold: true
+prepare_mimo_data <- function(data,
+                              date_col,
+                              input_vars,
+                              output_vars,
+                              lags       = 1:12,
+                              horizon    = 1,
+                              remove_na  = TRUE) {
+  
+  # Tidyeval the date column
+  date_col <- rlang::enquo(date_col)
+  
+  # 1) Order by time index
+  df_prep <- data %>%
+    dplyr::arrange(!!date_col)
+  
+  # 2) Generate lagged inputs via timetk
+  #    Creates columns like: sales_lag1, sales_lag2, ..., price_lag1, ...
+  df_prep <- df_prep %>%
+    timetk::tk_augment_lags(
+      .value = all_of(input_vars),
+      .lags  = lags
+    )
+  # 3) Generate future targets via dplyr::lead()
+  #    Creates columns like: sales_h1, sales_h2, ...
+  df_prep <- df_prep %>%
+    timetk::tk_augment_leads(
+      .value = all_of(output_vars),
+      .lags  = -horizon
+    )
+  
+      # Build vector of all generated column names
+    lag_cols    <- df_prep %>% select(contains("lag")) %>% names()
+    lead_cols   <- df_prep %>% select(contains("lead")) %>% names()
+    all_new_cols <- c(sort(lag_cols,decreasing = TRUE), lead_cols)
+  # 4) Optionally drop rows with NAs in any of the new columns
+  if (remove_na) {
+    
+    df_prep <- df_prep %>%
+      tidyr::drop_na(dplyr::all_of(all_new_cols))
+  }
+  
+  # Return the prepared tibble
+  df_prep <- df_prep %>% 
+              dplyr::select(!!date_col,
+                     dplyr::all_of(all_new_cols)) %>% 
+              dplyr::rename("date_lg0"=!!date_col)
+  #nm_df_prep <- df_prep %>% select(-!!date_col) %>% names()
+  #date_nm <- df_prep %>% select(!!date_col) %>% names()
+  #names(df_prep) <- c(date_nm,sort(nm_df_prep,decreasing = FALSE))
+  return(df_prep)
+}
+
+```
+
+
+### Struktur Data MIMO
+
+```{r}
+prepare_mimo_data(data = na.omit(df),
+                  date_col = date,
+                  input_vars = c("ADHK"),
+                  output_vars = c("ADHK"),
+                  lags = 0:2,
+                  remove_na = FALSE,
+                  horizon = 1:4)
+```
+
+## LSTM
+
+### Fungsi pembantu LSTM
+
+```{r}
+#| code-fold: true
+train_lstm_mimo <- function(data,
+                            date_col,
+                            input_cols,
+                            output_cols,
+                            val_split    = 0.2,
+                            epochs       = 50,
+                            batch_size   = 32,
+                            lr           = 1e-3,
+                            optimizer    = c("adam","sgd"),
+                            hidden_size  = 50,
+                            num_layers   = 1,
+                            activation   = c("tanh","relu","linear"),
+                            dropout      = 0.0,
+                            weight_decay = 0.0) {
+  optimizer <- match.arg(optimizer)
+  activation <- match.arg(activation)
+  date_col   <- rlang::ensym(date_col)
+
+  # 1) Order by time index
+  data <- data %>% arrange(!!date_col)
+
+  # 2) Split data
+  n     <- nrow(data)
+  n_val <- floor(val_split * n)
+  train_df <- data[1:(n - n_val), ]
+  val_df   <- data[(n - n_val + 1):n, ]
+
+  # 3) Compute robust scaler on train_df
+  input_median  <- sapply(input_cols, function(col) median(train_df[[col]], na.rm = TRUE))
+  input_iqr     <- sapply(input_cols, function(col) IQR(train_df[[col]], na.rm = TRUE))
+  output_median <- sapply(output_cols,function(col) median(train_df[[col]], na.rm = TRUE))
+  output_iqr    <- sapply(output_cols,function(col) IQR(train_df[[col]], na.rm = TRUE))
+  scaler <- list(
+    input_median  = input_median,
+    input_iqr     = input_iqr,
+    output_median = output_median,
+    output_iqr    = output_iqr
+  )
+
+  # 4) Apply scaling to train and validation sets
+  for (col in input_cols) {
+    train_df[[col]] <- (train_df[[col]] - scaler$input_median[col]) / scaler$input_iqr[col]
+    val_df[[col]]   <- (val_df[[col]]   - scaler$input_median[col]) / scaler$input_iqr[col]
+  }
+  for (col in output_cols) {
+    train_df[[col]] <- (train_df[[col]] - scaler$output_median[col]) / scaler$output_iqr[col]
+    val_df[[col]]   <- (val_df[[col]]   - scaler$output_median[col]) / scaler$output_iqr[col]
+  }
+
+  # 5) Define the LSTM module
+  LSTMModel <- nn_module(
+    "LSTMModel",
+    initialize = function(input_size, hidden_size, num_layers, dropout, output_size, activation) {
+      self$lstm <- nn_lstm(
+        input_size  = input_size,
+        hidden_size = hidden_size,
+        num_layers  = num_layers,
+        batch_first = TRUE,
+        dropout     = dropout
+      )
+      self$fc  <- nn_linear(hidden_size, output_size)
+      self$act <- switch(
+        activation,
+        tanh   = nn_tanh(),
+        relu   = nn_relu(),
+        linear = nn_identity()
+      )
+    },
+    forward = function(x) {
+      out    <- self$lstm(x)
+      h_last <- out[[1]][ , dim(out[[1]])[2], ]
+      h_act  <- self$act(h_last)
+      self$fc(h_act)
+    }
+  )
+
+  # 6) Prepare torch datasets
+  make_ds <- function(df) {
+    x_mat <- as.matrix(df[, input_cols])
+    y_mat <- as.matrix(df[, output_cols])
+    X <- torch_tensor(x_mat, dtype = torch_float())$view(c(nrow(x_mat), -1, length(input_cols)))
+    Y <- torch_tensor(y_mat, dtype = torch_float())
+    list(x = X, y = Y)
+  }
+  train_ds <- make_ds(train_df)
+  val_ds   <- make_ds(val_df)
+
+  # 7) Instantiate model and optimizer
+  model <- LSTMModel(
+    input_size  = length(input_cols),
+    hidden_size = hidden_size,
+    num_layers  = num_layers,
+    dropout     = dropout,
+    output_size = length(output_cols),
+    activation  = activation
+  )
+  optim <- switch(
+    optimizer,
+    adam = optim_adam(model$parameters, lr = lr, weight_decay = weight_decay),
+    sgd  = optim_sgd(model$parameters, lr = lr, weight_decay = weight_decay)
+  )
+  criterion <- nn_mse_loss()
+
+  # 8) Training loop
+  train_loss <- numeric(epochs)
+  val_loss   <- numeric(epochs)
+  for (e in seq_len(epochs)) {
+    model$train()
+    optim$zero_grad()
+    preds_train <- model(train_ds$x)
+    loss_train  <- criterion(preds_train, train_ds$y)
+    loss_train$backward()
+    optim$step()
+    train_loss[e] <- loss_train$item()
+
+    model$eval()
+    with_no_grad({
+      preds_val    <- model(val_ds$x)
+      val_loss[e]  <- criterion(preds_val, val_ds$y)$item()
+    })
+  }
+
+  list(
+    model       = model,
+    train_loss  = train_loss,
+    val_loss    = val_loss,
+    scaler      = scaler,
+    input_cols  = input_cols,
+    output_cols = output_cols,
+    date_col    = rlang::as_string(date_col)
+  )
+}
+```
+
+```{r}
+#| code-fold: true
+plot_lstm_history <- function(history) {
+  df <- tibble(
+    epoch = seq_along(history$train_loss),
+    training = sqrt(history$train_loss),
+    validation = sqrt(history$val_loss)
+  ) %>%
+    pivot_longer(-epoch, names_to = "data", values_to = "loss")
+
+  ggplot(df, aes(epoch, loss, color = data)) +
+    geom_line(size = 1) +
+    labs(
+      title = "Training vs Validation Loss",
+      x     = "Epoch",
+      y     = "RMSE"
+    ) +
+    theme_minimal()
+}
+```
+
+```{r}
+#| code-fold: true
+predict_lstm <- function(history, new_data) {
+  model       <- history$model
+  scaler      <- history$scaler
+  input_cols  <- history$input_cols
+  output_cols <- history$output_cols
+  date_col    <- history$date_col
+
+  dates <- new_data[[date_col]]
+  x_mat <- as.matrix(new_data[, input_cols])
+  X     <- torch_tensor(x_mat, dtype = torch_float())$view(c(nrow(x_mat), -1, ncol(x_mat)))
+
+  model$eval()
+  with_no_grad({ pred_scaled <- model(X) })
+  pred_scaled_mat <- as.matrix(pred_scaled)
+
+  # Inverse robust scaling
+  pred_orig <- sweep(pred_scaled_mat, 2, scaler$output_iqr, `*`)
+  pred_orig <- sweep(pred_orig, 2, scaler$output_median, `+`)
+
+  # Build output tibble
+  pred_df <- as_tibble(pred_orig)
+  names(pred_df) <- output_cols
+  tibble(date = dates) %>% bind_cols(pred_df)
+}
+```
+
+```{r}
+#| code-fold: true
+forecast_lstm <- function(history,output_var,train_data,test_data=NULL){
+  forecast <- predict_lstm(history = history,
+                           new_data = train_data %>% slice_tail(n = 1)) %>% 
+                            pivot_longer(-where(is.Date),
+                                         values_to = "forecast"
+                                         )
+
+new_dates <-  train_data %>% 
+              slice_tail(n = 1) %>% 
+              select(where(is.Date)) %>% 
+              pull()
+
+for (i in seq(nrow(forecast))) {
+  new_dates[i+1] <- ymd(new_dates[i]) + months(3)
+}
+forecast_df <- tibble(date=new_dates[-1],
+                      forecast = forecast %>% pull(forecast)
+                      )
+result <- train_data %>% 
+    select(where(is.Date),all_of(output_var)) %>% 
+    pivot_longer(-where(is.Date),names_to = "type") %>% 
+    mutate(type="actual") %>% 
+    rename_with(.cols = where(is.Date),.fn = function(x) "date" ) %>% 
+    bind_rows(
+forecast_df %>% 
+  pivot_longer(-where(is.Date),names_to = "type")
+    ) %>% 
+  rename_with(.cols=where(is.Date),.fn =  function(x) "date" )
+
+if(!is.null(test_data)){
+test_data <- test_data %>% 
+              select(where(is.Date),all_of(output_var)) %>% 
+              pivot_longer(-where(is.Date),names_to = "type") %>% 
+              mutate(type="actual") %>% 
+              rename_with(.cols = where(is.Date),.fn = function(x) "date" )
+result <- bind_rows(result,test_data)
+}
+
+return(result)
+}
+```
+
+### Satu Variabel
+
+```{r}
+mimo_df1 <- prepare_mimo_data(data = na.omit(df),
+                  date_col = date,
+                  input_vars = c("ADHK"),
+                  output_vars = c("ADHK"),
+                  lags = 0:2,
+                  remove_na = TRUE,
+                  horizon = 1:4)
+mimo_df1
+```
+
+
+```{r}
+train_df <- mimo_df1 %>% 
+            filter(date_lg0<"2022-01-01")
+train_df
+```
+
+```{r}
+test_df <- mimo_df1 %>% 
+            filter(date_lg0>="2022-01-01")
+test_df
+```
+
+
+
+```{r}
+input_cols <- names(select(train_df,contains("lag")))
+input_cols
+output_cols <- names(select(train_df,contains("lead")))
+output_cols
+```
+
+
+```{r}
+mod <- train_lstm_mimo(data = train_df,
+                     input_cols = input_cols,
+                     output_cols = output_cols,
+                     date_col = "date_lg0",
+                     val_split = 0.2,
+                     epochs = 75,
+                     batch_size = 32,
+                     optimizer = "adam",
+                     hidden_size = 10,
+                     num_layers = 1,
+                     activation = "linear")
+mod$model
+```
+
+
+```{r}
+plot_lstm_history(mod)
+```
+
+
+```{r}
+res1 <- forecast_lstm(history = mod,
+                      output_var = "ADHK_lag0",
+                      train_data = train_df,
+                      test_data = test_df)
+res1 %>% filter(type=="forecast")
+```
+
+
+```{r}
+# RMSE
+yardstick::rmse_vec(truth = filter(res1,
+                                   type=="actual",
+                                   date>="2022-01-01") %>% pull(value),
+                    estimate = filter(res1,
+                                   type=="forecast") %>% pull(value)
+                                   )
+```
+
+
+
+
+```{r}
+# MAPE
+yardstick::mape_vec(truth = filter(res1,
+                                   type=="actual",
+                                   date>="2022-01-01") %>% pull(value),
+                    estimate = filter(res1,
+                                   type=="forecast") %>% pull(value)
+                                   )
+```
+
+
+```{r}
+plot_time_series(.data=res1,
+                 .date_var = date,
+                 .value = value,
+                 .interactive = TRUE,
+                 .title =  "Forecast Plot",
+                 .color_var = type,
+                 .legend_show = FALSE,
+                 .smooth = FALSE)
+```
+
+### Multi Variabel
+
+```{r}
+#input_vars <- names(select(df,-c(date,ADHK)))
+input_vars <- c("ekspor","ihk")
+input_vars
+```
+
+
+```{r}
+mimo_df2 <- prepare_mimo_data(data = na.omit(df),
+                  date_col = date,
+                  input_vars = c("ADHK",input_vars),
+                  output_vars = c("ADHK"),
+                  lags = 0:2,
+                  remove_na = TRUE,
+                  horizon = 1:4)
+mimo_df2
+```
+
+
+```{r}
+train_df <- mimo_df2 %>% 
+            filter(date_lg0<"2022-01-01")
+train_df
+```
+
+```{r}
+test_df <- mimo_df2 %>% 
+            filter(date_lg0>="2022-01-01")
+test_df
+```
+
+
+
+```{r}
+input_cols <- names(select(train_df,contains("lag")))
+input_cols
+output_cols <- names(select(train_df,contains("lead")))
+output_cols
+```
+
+
+```{r}
+mod2 <- train_lstm_mimo(data = train_df,
+                     input_cols = input_cols,
+                     output_cols = output_cols,
+                     date_col = "date_lg0",
+                     val_split = 0.2,
+                     epochs = 100,
+                     batch_size = 32,
+                     optimizer = "adam",
+                     hidden_size = 100,
+                     num_layers = 1,
+                     activation = "linear")
+mod2$model
+```
+
+
+```{r}
+plot_lstm_history(mod2)
+```
+
+
+```{r}
+res2 <- forecast_lstm(history = mod2,
+                      output_var = "ADHK_lag0",
+                      train_data = train_df,
+                      test_data = test_df)
+res2 %>% filter(type=="forecast")
+```
+
+
+```{r}
+# RMSE
+yardstick::rmse_vec(truth = filter(res2,
+                                   type=="actual",
+                                   date>="2022-01-01") %>% pull(value),
+                    estimate = filter(res2,
+                                   type=="forecast") %>% pull(value)
+                                   )
+```
+
+
+
+
+```{r}
+# MAPE
+yardstick::mape_vec(truth = filter(res2,
+                                   type=="actual",
+                                   date>="2022-01-01") %>% pull(value),
+                    estimate = filter(res2,
+                                   type=="forecast") %>% pull(value)
+                                   )
+```
+
+
+```{r}
+plot_time_series(.data=res2,
+                 .date_var = date,
+                 .value = value,
+                 .interactive = TRUE,
+                 .title =  "Forecast Plot",
+                 .color_var = type,
+                 .legend_show = FALSE,
+                 .smooth = FALSE)
+```
+
+## RNN
+
+### Fungsi Pembantu
+
+```{r}
+#| code-fold: true
+train_rnn_mimo <- function(data,
+                            date_col,
+                            input_cols,
+                            output_cols,
+                            val_split    = 0.2,
+                            epochs       = 50,
+                            batch_size   = 32,
+                            lr           = 1e-3,
+                            optimizer    = c("adam","sgd"),
+                            hidden_size  = 50,
+                            num_layers   = 1,
+                            activation   = c("tanh","relu","linear"),
+                            dropout      = 0.0,
+                            weight_decay = 0.0) {
+  optimizer <- match.arg(optimizer)
+  activation <- match.arg(activation)
+  date_col   <- rlang::ensym(date_col)
+
+  # 1) Order by time index
+  data <- data %>% arrange(!!date_col)
+
+  # 2) Split data
+  n     <- nrow(data)
+  n_val <- floor(val_split * n)
+  train_df <- data[1:(n - n_val), ]
+  val_df   <- data[(n - n_val + 1):n, ]
+
+  # 3) Compute robust scaler on train_df
+  input_median  <- sapply(input_cols, function(col) median(train_df[[col]], na.rm = TRUE))
+  input_iqr     <- sapply(input_cols, function(col) IQR(train_df[[col]], na.rm = TRUE))
+  output_median <- sapply(output_cols,function(col) median(train_df[[col]], na.rm = TRUE))
+  output_iqr    <- sapply(output_cols,function(col) IQR(train_df[[col]], na.rm = TRUE))
+  scaler <- list(
+    input_median  = input_median,
+    input_iqr     = input_iqr,
+    output_median = output_median,
+    output_iqr    = output_iqr
+  )
+
+  # 4) Apply scaling to train and validation sets
+  for (col in input_cols) {
+    train_df[[col]] <- (train_df[[col]] - scaler$input_median[col]) / scaler$input_iqr[col]
+    val_df[[col]]   <- (val_df[[col]]   - scaler$input_median[col]) / scaler$input_iqr[col]
+  }
+  for (col in output_cols) {
+    train_df[[col]] <- (train_df[[col]] - scaler$output_median[col]) / scaler$output_iqr[col]
+    val_df[[col]]   <- (val_df[[col]]   - scaler$output_median[col]) / scaler$output_iqr[col]
+  }
+
+  # 5) Define the RNN module
+  RNNModel <- nn_module(
+  "RNNModel",
+  initialize = function(input_size,
+                        hidden_size,
+                        num_layers,
+                        dropout,
+                        output_size,
+                        activation,
+                        nonlinearity = c("tanh","relu")) {
+    nonlinearity <- match.arg(nonlinearity)
+    self$rnn <- nn_rnn(
+      input_size   = input_size,
+      hidden_size  = hidden_size,
+      num_layers   = num_layers,
+      nonlinearity = nonlinearity,
+      batch_first  = TRUE,
+      dropout      = dropout
+    )
+    self$fc  <- nn_linear(hidden_size, output_size)
+    self$act <- switch(
+      activation,
+      tanh   = nn_tanh(),
+      relu   = nn_relu(),
+      linear = nn_identity()
+    )
+  },
+  forward = function(x) {
+    # x: [batch, seq_len, input_size]
+    out   <- self$rnn(x)
+    # out[[1]] is the output at every time step: shape [batch, seq_len, hidden]
+    last  <- out[[1]][ , dim(out[[1]])[2], ]
+    h_act <- self$act(last)
+    self$fc(h_act)
+  }
+)
+
+
+  # 6) Prepare torch datasets
+  make_ds <- function(df) {
+    x_mat <- as.matrix(df[, input_cols])
+    y_mat <- as.matrix(df[, output_cols])
+    X <- torch_tensor(x_mat, dtype = torch_float())$view(c(nrow(x_mat), -1, length(input_cols)))
+    Y <- torch_tensor(y_mat, dtype = torch_float())
+    list(x = X, y = Y)
+  }
+  train_ds <- make_ds(train_df)
+  val_ds   <- make_ds(val_df)
+
+  # 7) Instantiate model and optimizer
+  model <- RNNModel(
+  input_size   = length(input_cols),
+  hidden_size  = hidden_size,
+  num_layers   = num_layers,
+  dropout      = dropout,
+  output_size  = length(output_cols),
+  activation   = activation,
+  nonlinearity = "relu")
+
+  optim <- switch(
+    optimizer,
+    adam = optim_adam(model$parameters, lr = lr, weight_decay = weight_decay),
+    sgd  = optim_sgd(model$parameters, lr = lr, weight_decay = weight_decay)
+  )
+  criterion <- nn_mse_loss()
+
+  # 8) Training loop
+  train_loss <- numeric(epochs)
+  val_loss   <- numeric(epochs)
+  for (e in seq_len(epochs)) {
+    model$train()
+    optim$zero_grad()
+    preds_train <- model(train_ds$x)
+    loss_train  <- criterion(preds_train, train_ds$y)
+    loss_train$backward()
+    optim$step()
+    train_loss[e] <- loss_train$item()
+
+    model$eval()
+    with_no_grad({
+      preds_val    <- model(val_ds$x)
+      val_loss[e]  <- criterion(preds_val, val_ds$y)$item()
+    })
+  }
+
+  list(
+    model       = model,
+    train_loss  = train_loss,
+    val_loss    = val_loss,
+    scaler      = scaler,
+    input_cols  = input_cols,
+    output_cols = output_cols,
+    date_col    = rlang::as_string(date_col)
+  )
+}
+```
+
+```{r}
+#| code-fold: true
+plot_rnn_history <- function(history) {
+  df <- tibble(
+    epoch = seq_along(history$train_loss),
+    training = sqrt(history$train_loss),
+    validation = sqrt(history$val_loss)
+  ) %>%
+    pivot_longer(-epoch, names_to = "data", values_to = "loss")
+
+  ggplot(df, aes(epoch, loss, color = data)) +
+    geom_line(size = 1) +
+    labs(
+      title = "Training vs Validation Loss",
+      x     = "Epoch",
+      y     = "RMSE"
+    ) +
+    theme_minimal()
+}
+```
+
+```{r}
+#| code-fold: true
+predict_rnn <- function(history, new_data) {
+  model       <- history$model
+  scaler      <- history$scaler
+  input_cols  <- history$input_cols
+  output_cols <- history$output_cols
+  date_col    <- history$date_col
+
+  dates <- new_data[[date_col]]
+  x_mat <- as.matrix(new_data[, input_cols])
+  X     <- torch_tensor(x_mat, dtype = torch_float())$view(c(nrow(x_mat), -1, ncol(x_mat)))
+
+  model$eval()
+  with_no_grad({ pred_scaled <- model(X) })
+  pred_scaled_mat <- as.matrix(pred_scaled)
+
+  # Inverse robust scaling
+  pred_orig <- sweep(pred_scaled_mat, 2, scaler$output_iqr, `*`)
+  pred_orig <- sweep(pred_orig, 2, scaler$output_median, `+`)
+
+  # Build output tibble
+  pred_df <- as_tibble(pred_orig)
+  names(pred_df) <- output_cols
+  tibble(date = dates) %>% bind_cols(pred_df)
+}
+```
+
+```{r}
+#| code-fold: true
+forecast_rnn <- function(history,output_var,train_data,test_data=NULL){
+  forecast <- predict_rnn(history = history,
+                           new_data = train_data %>% slice_tail(n = 1)) %>% 
+                            pivot_longer(-where(is.Date),
+                                         values_to = "forecast"
+                                         )
+
+new_dates <-  train_data %>% 
+              slice_tail(n = 1) %>% 
+              select(where(is.Date)) %>% 
+              pull()
+
+for (i in seq(nrow(forecast))) {
+  new_dates[i+1] <- ymd(new_dates[i]) + months(3)
+}
+forecast_df <- tibble(date=new_dates[-1],
+                      forecast = forecast %>% pull(forecast)
+                      )
+result <- train_data %>% 
+    select(where(is.Date),all_of(output_var)) %>% 
+    pivot_longer(-where(is.Date),names_to = "type") %>% 
+    mutate(type="actual") %>% 
+    rename_with(.cols = where(is.Date),.fn = function(x) "date" ) %>% 
+    bind_rows(
+forecast_df %>% 
+  pivot_longer(-where(is.Date),names_to = "type")
+    ) %>% 
+  rename_with(.cols=where(is.Date),.fn =  function(x) "date" )
+
+if(!is.null(test_data)){
+test_data <- test_data %>% 
+              select(where(is.Date),all_of(output_var)) %>% 
+              pivot_longer(-where(is.Date),names_to = "type") %>% 
+              mutate(type="actual") %>% 
+              rename_with(.cols = where(is.Date),.fn = function(x) "date" )
+result <- bind_rows(result,test_data)
+}
+
+return(result)
+}
+```
+
+
+
+
+### Satu Variabel
+
+```{r}
+mimo_df1 <- prepare_mimo_data(data = na.omit(df),
+                  date_col = date,
+                  input_vars = c("ADHK"),
+                  output_vars = c("ADHK"),
+                  lags = 0:2,
+                  remove_na = TRUE,
+                  horizon = 1:4)
+mimo_df1
+```
+
+
+```{r}
+train_df <- mimo_df1 %>% 
+            filter(date_lg0<"2022-01-01")
+train_df
+```
+
+```{r}
+test_df <- mimo_df1 %>% 
+            filter(date_lg0>="2022-01-01")
+test_df
+```
+
+
+
+```{r}
+input_cols <- names(select(train_df,contains("lag")))
+input_cols
+output_cols <- names(select(train_df,contains("lead")))
+output_cols
+```
+
+
+```{r}
+mod3 <- train_rnn_mimo(data = train_df,
+                     input_cols = input_cols,
+                     output_cols = output_cols,
+                     date_col = "date_lg0",
+                     val_split = 0.2,
+                     epochs = 75,
+                     batch_size = 32,
+                     optimizer = "adam",
+                     hidden_size = 10,
+                     num_layers = 1,
+                     activation = "linear")
+mod3$model
+```
+
+
+```{r}
+plot_rnn_history(mod3)
+```
+
+
+```{r}
+res3 <- forecast_rnn(history = mod3,
+                      output_var = "ADHK_lag0",
+                      train_data = train_df,
+                      test_data = test_df)
+res3 %>% filter(type=="forecast")
+```
+
+
+```{r}
+# RMSE
+yardstick::rmse_vec(truth = filter(res3,
+                                   type=="actual",
+                                   date>="2022-01-01") %>% pull(value),
+                    estimate = filter(res3,
+                                   type=="forecast") %>% pull(value)
+                                   )
+```
+
+
+
+
+```{r}
+# MAPE
+yardstick::mape_vec(truth = filter(res3,
+                                   type=="actual",
+                                   date>="2022-01-01") %>% pull(value),
+                    estimate = filter(res3,
+                                   type=="forecast") %>% pull(value)
+                                   )
+```
+
+
+```{r}
+plot_time_series(.data=res3,
+                 .date_var = date,
+                 .value = value,
+                 .interactive = TRUE,
+                 .title =  "Forecast Plot",
+                 .color_var = type,
+                 .legend_show = FALSE,
+                 .smooth = FALSE)
+```
+
+### Multi Variabel
+
+```{r}
+#input_vars <- names(select(df,-c(date,ADHK)))
+input_vars <- c("ekspor","ihk")
+input_vars
+```
+
+
+```{r}
+mimo_df2 <- prepare_mimo_data(data = na.omit(df),
+                  date_col = date,
+                  input_vars = c("ADHK",input_vars),
+                  output_vars = c("ADHK"),
+                  lags = 0:2,
+                  remove_na = TRUE,
+                  horizon = 1:4)
+mimo_df2
+```
+
+
+```{r}
+train_df <- mimo_df2 %>% 
+            filter(date_lg0<"2022-01-01")
+train_df
+```
+
+```{r}
+test_df <- mimo_df2 %>% 
+            filter(date_lg0>="2022-01-01")
+test_df
+```
+
+
+
+```{r}
+input_cols <- names(select(train_df,contains("lag")))
+input_cols
+output_cols <- names(select(train_df,contains("lead")))
+output_cols
+```
+
+
+```{r}
+mod4 <- train_rnn_mimo(data = train_df,
+                     input_cols = input_cols,
+                     output_cols = output_cols,
+                     date_col = "date_lg0",
+                     val_split = 0.2,
+                     epochs = 100,
+                     batch_size = 32,
+                     optimizer = "adam",
+                     hidden_size = 100,
+                     num_layers = 1,
+                     activation = "linear")
+mod4$model
+```
+
+
+```{r}
+plot_rnn_history(mod4)
+```
+
+
+```{r}
+res4 <- forecast_lstm(history = mod4,
+                      output_var = "ADHK_lag0",
+                      train_data = train_df,
+                      test_data = test_df)
+res4 %>% filter(type=="forecast")
+```
+
+
+```{r}
+# RMSE
+yardstick::rmse_vec(truth = filter(res4,
+                                   type=="actual",
+                                   date>="2022-01-01") %>% pull(value),
+                    estimate = filter(res4,
+                                   type=="forecast") %>% pull(value)
+                                   )
+```
+
+
+
+
+```{r}
+# MAPE
+yardstick::mape_vec(truth = filter(res4,
+                                   type=="actual",
+                                   date>="2022-01-01") %>% pull(value),
+                    estimate = filter(res4,
+                                   type=="forecast") %>% pull(value)
+                                   )
+```
+
+
+```{r}
+plot_time_series(.data=res4,
+                 .date_var = date,
+                 .value = value,
+                 .interactive = TRUE,
+                 .title =  "Forecast Plot",
+                 .color_var = type,
+                 .legend_show = FALSE,
+                 .smooth = FALSE)
+```
+
+
