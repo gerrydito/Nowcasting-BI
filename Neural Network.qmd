@@ -155,7 +155,7 @@ prepare_mimo_data(data = df,
                   horizon = 1:4)
 ```
 
-## Time Series Nerual Network
+## Time Series Neural Network
 
 ### Fungsi pembantu
 
@@ -212,19 +212,38 @@ return(forecast)
 
 ```{r}
 #| code-fold: true
-forecast_mlp_plot <- function(result,test_data){
-result %>% 
-  bind_rows(test_data %>% 
-            mutate(type="actual") %>% 
-              magrittr::set_names(c("date","value","type"))
-              ) %>% 
-  plot_time_series(.date_var = date,
-                 .value = value,
-                 .interactive = TRUE,
-                 .title =  "Forecast Plot",
-                 .color_var = type,
-                 .legend_show = FALSE,
-                 .smooth = FALSE)
+forecast_mlp_plot <- function(result, test_data, interactive = FALSE) {
+  full_data <- result %>%
+    bind_rows(test_data %>%
+                mutate(type = "actual") %>%
+                magrittr::set_names(c("date", "value", "type")))
+  n_row <- nrow(test_data)
+  if (n_row == 1) {
+    p <- full_data %>%
+      filter(type == "actual") %>%
+      ggplot(aes(x = date, y = value, colour = type)) +
+      geom_line() +
+      ggtitle("Forecast Plot") +
+      geom_point(data = full_data  %>% filter(type == "forecast")) +
+      theme_bw() +
+      theme(legend.position = "none")
+    if (interactive) {
+      plotly::ggplotly(p)
+    } else{
+      p
+    }
+  } else{
+    full_data %>%
+      plot_time_series(
+        .date_var = date,
+        .value = value,
+        .interactive = interactive,
+        .title =  "Forecast Plot",
+        .color_var = type,
+        .legend_show = FALSE,
+        .smooth = FALSE
+      )
+  }
 }
 ```
 
@@ -261,7 +280,7 @@ train_df1 <- prepare_mimo_data(data = train_df1,
                   date_col = date,
                   input_vars = c("ADHK"),
                   output_vars = c("ADHK"),
-                  lags = 0:4,
+                  lags = 0,
                   remove_na = FALSE,
                   horizon = 1)
 train_df1
@@ -334,7 +353,9 @@ mape_vec(truth = test_df1$ADHK,
 ```
 
 ```{r}
-forecast_mlp_plot(result = res01,test_data = test_df1)
+forecast_mlp_plot(result = res01,
+                  test_data = test_df1,
+                  interactive=TRUE)
 ```
 
 
@@ -407,7 +428,8 @@ mape_vec(truth = test_df2$ADHK,
 
 
 ```{r}
-forecast_mlp_plot(result = res2,test_data = test_df2)
+forecast_mlp_plot(result = res2,test_data = test_df2,
+                  interactive=TRUE)
 ```
 
 
