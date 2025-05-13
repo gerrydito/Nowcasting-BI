@@ -334,7 +334,7 @@ mape_vec(truth = test_df1$ADHK,
 ```
 
 ```{r}
-forecast_mlp_plot(result = res1,test_data = test_df1)
+forecast_mlp_plot(result = res01,test_data = test_df1)
 ```
 
 
