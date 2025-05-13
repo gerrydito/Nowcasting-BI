@@ -1,0 +1,489 @@
+---
+title: "Neural Network for forecasting"
+format:
+  html:
+    toc: true
+    embed-resources: true
+    df-print: paged
+    toc-depth: 6
+---
+
+## Package
+
+```{r}
+#| output: false
+library(tidyverse)
+library(readxl)
+library(timetk)
+library(skimr)
+library(datawizard)
+library(neuralnet)
+library(yardstick)
+```
+
+
+## Import Data
+
+```{r}
+df <- read_excel("Data_PDRB_siap2.xlsx",sheet = 2)
+glimpse(df)
+```
+
+```{r}
+df <- mutate(df,date = ymd(date))
+glimpse(df)
+```
+
+## Grafik Time Series
+
+
+### Fungsi pembantu
+
+```{r}
+#| code-fold: true
+multi_plot_time_series <- function(data,date,exclude_var=NULL,.interactive=TRUE,n_col=2,n_row=2,.title="Multiple Time Series"){
+data %>% 
+  select(-all_of(exclude_var)) %>% 
+  select(all_of(date),where(is.numeric)) %>% 
+  pivot_longer(cols = -all_of(date),
+               names_to = "variable",
+               values_to = "value") %>% 
+  group_by(variable) %>% 
+    plot_time_series(.data=,
+                 .date_var = date,
+                 .value = value,
+                 .interactive = .interactive,
+                 .title =  .title,
+                 .facet_ncol = n_col,
+                 .facet_nrow = n_row,
+                 .smooth = FALSE)
+}  
+
+```
+
+## Single Time Series
+
+```{r}
+plot_time_series(.data=df,
+                 .date_var = date,
+                 .value = ADHK,
+                 .interactive = TRUE,
+                 .title =  "ADHK",
+                 .smooth = FALSE)
+```
+
+### Multiple Plot
+
+```{r}
+multi_plot_time_series(df,
+                       date = "date",
+                       exclude_var = "ADHK",
+                       .interactive=FALSE,
+                       n_col = 2)
+```
+
+## Multi Input Multi Output (MIMO)
+
+### Fungsi pembantu
+
+```{r}
+#| code-fold: true
+prepare_mimo_data <- function(data,
+                              date_col,
+                              input_vars,
+                              output_vars,
+                              lags       = 1:12,
+                              horizon    = 1,
+                              remove_na  = TRUE) {
+  
+  # Tidyeval the date column
+  date_col <- rlang::enquo(date_col)
+  
+  # 1) Order by time index
+  df_prep <- data %>%
+    dplyr::arrange(!!date_col)
+  
+  # 2) Generate lagged inputs via timetk
+  #    Creates columns like: sales_lag1, sales_lag2, ..., price_lag1, ...
+  df_prep <- df_prep %>%
+    timetk::tk_augment_lags(
+      .value = all_of(input_vars),
+      .lags  = lags
+    )
+  # 3) Generate future targets via dplyr::lead()
+  #    Creates columns like: sales_h1, sales_h2, ...
+  df_prep <- df_prep %>%
+    timetk::tk_augment_leads(
+      .value = all_of(output_vars),
+      .lags  = -horizon
+    )
+  
+      # Build vector of all generated column names
+    lag_cols    <- df_prep %>% select(contains("lag")) %>% names()
+    lead_cols   <- df_prep %>% select(contains("lead")) %>% names()
+    all_new_cols <- c(sort(lag_cols,decreasing = TRUE), lead_cols)
+  # 4) Optionally drop rows with NAs in any of the new columns
+  if (remove_na) {
+    
+    df_prep <- df_prep %>%
+      tidyr::drop_na(dplyr::all_of(all_new_cols))
+  }
+  
+  # Return the prepared tibble
+  df_prep <- df_prep %>% 
+              dplyr::select(!!date_col,
+                     dplyr::all_of(all_new_cols)) %>% 
+              dplyr::rename("date_lg0"=!!date_col)
+  #nm_df_prep <- df_prep %>% select(-!!date_col) %>% names()
+  #date_nm <- df_prep %>% select(!!date_col) %>% names()
+  #names(df_prep) <- c(date_nm,sort(nm_df_prep,decreasing = FALSE))
+  return(df_prep)
+}
+
+```
+
+
+### Struktur Data MIMO
+
+```{r}
+prepare_mimo_data(data = df,
+                  date_col = date,
+                  input_vars = c("ADHK"),
+                  output_vars = c("ADHK"),
+                  lags = 0:2,
+                  remove_na = FALSE,
+                  horizon = 1:4)
+```
+
+## Time Series Nerual Network
+
+### Fungsi pembantu
+
+```{r}
+#| code-fold: true
+train_mlp_mimo <- function(formula = formula,data=data,hidden=hidden,activation="linear",...){
+data0 <- data
+data1 <- data %>% drop_na()
+data <- standardize(data1,select = is.numeric,robust = TRUE)
+data1 <- standardize(data0,select = is.numeric,robust = TRUE,reference=data1)
+
+activation =  switch(
+        activation,
+        tanh   = function(x) tanh(x),
+        linear = function(x) x,
+        logistic ="logistic"
+      )
+model <- neuralnet(formula = formula,
+                   data = data,hidden = hidden, act.fct = activation,...)
+model$data0 <- data0
+model$data1 <- data1
+return(model)
+}
+```
+
+```{r}
+#| code-fold: true
+forecast_mlp <- function(model,real_out_cols){
+df_dt <- model$data0 %>% 
+          select(where(is.Date)) %>% 
+          pull()
+date_smry <- tk_get_timeseries_summary(df_dt)
+future_date <- tk_make_timeseries(df_dt %>% tail(1),
+                                  length_out = 1+ncol(model$response),
+                                  by = date_smry$scale)
+future_date <- future_date[-1]
+
+forecast <- predict(model,newdata = model$data1 %>% slice_tail(n=1)) %>% 
+  as.data.frame()
+names(forecast) <- colnames(model$response)
+forecast <- unstandardize(forecast,robust = TRUE,
+                          reference = drop_na(model$data0)
+                          ) %>% 
+            as.numeric()
+past_data <- model$data0 %>% 
+              select(where(is.Date),all_of(real_out_cols)) %>% 
+              mutate(type="actual") %>% 
+              magrittr::set_names(c("date","value","type"))
+forecast <- data.frame(date=future_date,value=forecast,type="forecast")
+forecast <- bind_rows(past_data,forecast)
+return(forecast)
+}
+```
+
+```{r}
+#| code-fold: true
+forecast_mlp_plot <- function(result,test_data){
+result %>% 
+  bind_rows(test_data %>% 
+            mutate(type="actual") %>% 
+              magrittr::set_names(c("date","value","type"))
+              ) %>% 
+  plot_time_series(.date_var = date,
+                 .value = value,
+                 .interactive = TRUE,
+                 .title =  "Forecast Plot",
+                 .color_var = type,
+                 .legend_show = FALSE,
+                 .smooth = FALSE)
+}
+```
+
+
+### Single Input Single Output
+
+#### Pembagian data
+
+```{r}
+train_df1 <-  df %>% 
+            filter(date<="2023-09-01")
+train_df1$date
+```
+
+```{r}
+train_df01 <-  df %>% 
+            filter(date<="2023-09-01")
+train_df01$date
+```
+
+
+```{r}
+test_df1 <-  df %>% 
+            select(date,ADHK) %>% 
+            filter(date>"2023-09-01")
+test_df1$date
+```
+
+#### Reshaping MIMO Data
+
+
+```{r}
+train_df1 <- prepare_mimo_data(data = train_df1,
+                  date_col = date,
+                  input_vars = c("ADHK"),
+                  output_vars = c("ADHK"),
+                  lags = 0:4,
+                  remove_na = FALSE,
+                  horizon = 1)
+train_df1
+```
+
+```{r}
+train_df01 <- prepare_mimo_data(data = train_df01,
+                  date_col = date,
+                  input_vars = c("ADHK"),
+                  output_vars = c("ADHK"),
+                  lags = 0:4,
+                  remove_na = FALSE,
+                  horizon = 1)
+train_df01
+```
+
+
+```{r}
+test_df1
+```
+
+#### Modeling
+
+```{r}
+set.seed(2045)
+mod1 <- train_mlp_mimo(ADHK_lead1 ~ ADHK_lag0,data=train_df1,
+                      hidden = c(5),
+                      activation = "linear")
+plot(mod1)
+```
+
+```{r}
+set.seed(2045)
+mod01 <- train_mlp_mimo(ADHK_lead1 ~ ADHK_lag0 + ADHK_lag1 + ADHK_lag2 + ADHK_lag3 + ADHK_lag4,data=train_df01,
+                      hidden = c(5),
+                      activation = "linear")
+```
+
+
+
+```{r}
+res1 <- forecast_mlp(model = mod1,real_out_cols="ADHK_lag0")
+res1 %>% 
+  filter(type=="forecast")
+```
+
+```{r}
+res01 <- forecast_mlp(model = mod01,real_out_cols="ADHK_lag0")
+res01 %>% 
+  filter(type=="forecast")
+```
+
+
+```{r}
+test_df1
+```
+
+```{r}
+rmse_vec(truth = test_df1$ADHK,
+         estimate = filter(res1,type=="forecast") %>% pull(value))
+mape_vec(truth = test_df1$ADHK,
+         estimate = filter(res1,type=="forecast") %>% pull(value))
+```
+
+```{r}
+rmse_vec(truth = test_df1$ADHK,
+         estimate = filter(res01,type=="forecast") %>% pull(value))
+mape_vec(truth = test_df1$ADHK,
+         estimate = filter(res01,type=="forecast") %>% pull(value))
+```
+
+```{r}
+forecast_mlp_plot(result = res1,test_data = test_df1)
+```
+
+
+
+
+
+### Single Input Multi Output
+
+#### Pembagian data
+
+```{r}
+train_df2 <-  df %>% 
+            filter(date<="2023-06-01")
+train_df2$date
+```
+
+```{r}
+test_df2 <-  df %>% 
+            select(date,ADHK) %>% 
+            filter(date>"2023-06-01")
+test_df2$date
+```
+
+#### Reshaping MIMO Data
+
+```{r}
+train_df2 <- prepare_mimo_data(data = train_df2,
+                  date_col = date,
+                  input_vars = c("ADHK"),
+                  output_vars = c("ADHK"),
+                  lags = 0,
+                  remove_na = FALSE,
+                  horizon = 1:2)
+train_df2
+```
+
+```{r}
+test_df2
+```
+
+#### Modeling
+
+```{r}
+set.seed(2045)
+mod2 <- train_mlp_mimo(ADHK_lead1 + ADHK_lead2 ~ ADHK_lag0,data=train_df2,
+                      hidden = c(5),
+                      activation = "linear")
+plot(mod2)
+```
+
+
+
+
+```{r}
+res2 <- forecast_mlp(model = mod2,real_out_cols="ADHK_lag0")
+res2 %>% 
+  filter(type=="forecast")
+```
+
+```{r}
+test_df2
+```
+
+```{r}
+rmse_vec(truth = test_df2$ADHK,
+         estimate = filter(res2,type=="forecast") %>% pull(value))
+mape_vec(truth = test_df2$ADHK,
+         estimate = filter(res2,type=="forecast") %>% pull(value))
+```
+
+
+```{r}
+forecast_mlp_plot(result = res2,test_data = test_df2)
+```
+
+
+
+
+
+
+### Multi Input Multi Output
+
+#### Pembagian data
+
+```{r}
+train_df3 <-  df %>% 
+            filter(date<="2023-06-01")
+train_df3$date
+```
+
+```{r}
+test_df3 <-  df %>% 
+            select(date,ADHK) %>% 
+            filter(date>"2023-06-01")
+test_df3$date
+```
+
+#### Reshaping MIMO Data
+
+```{r}
+train_df3 <- prepare_mimo_data(data = train_df3,
+                  date_col = date,
+                  input_vars = c("ADHK"),
+                  output_vars = c("ADHK"),
+                  lags = 0:1,
+                  remove_na = FALSE,
+                  horizon = 1:2)
+train_df3
+```
+
+```{r}
+test_df3
+```
+
+#### Modeling
+
+```{r}
+set.seed(2045)
+mod3 <- train_mlp_mimo(ADHK_lead1 + ADHK_lead2 ~ ADHK_lag0 + ADHK_lag1,
+                       data=train_df3,
+                      hidden = c(10),
+                      activation = "linear")
+plot(mod3)
+```
+
+
+
+
+```{r}
+res3 <- forecast_mlp(model = mod3,real_out_cols="ADHK_lag0")
+res3 %>% 
+  filter(type=="forecast")
+```
+
+```{r}
+test_df3
+```
+
+
+```{r}
+rmse_vec(truth = test_df3$ADHK,
+         estimate = filter(res3,type=="forecast") %>% pull(value))
+mape_vec(truth = test_df3$ADHK,
+         estimate = filter(res3,type=="forecast") %>% pull(value))
+```
+
+
+```{r}
+forecast_mlp_plot(result = res3,test_data = test_df3)
+```
+
+

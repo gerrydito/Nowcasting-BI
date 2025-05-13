@@ -4,6 +4,8 @@ format:
   html:
     toc: true
     embed-resources: true
+    df-print: paged
+    toc-depth: 6
 ---
 
 ## Package
@@ -17,8 +19,10 @@ library(skimr)
 library(torch)
 ```
 
+## Import Data
+
 ```{r}
-df <- read_excel("Data_PDRB_siap.xlsx")
+df <- read_excel("Data_PDRB_siap2.xlsx",sheet = 2)
 glimpse(df)
 ```
 
@@ -34,19 +38,10 @@ glimpse(df)
 
 ## Grafik Time Series
 
+### Fungsi pembantu
 
 ```{r}
-plot_time_series(.data=na.omit(df),
-                 .date_var = date,
-                 .value = ADHK,
-                 .interactive = TRUE,
-                 .title =  "ADHK",
-                 .smooth = FALSE)
-```
-
-fungsi pembantu
-
-```{r}
+#| code-fold: true
 multi_plot_time_series <- function(data,date,exclude_var=NULL,.interactive=TRUE,n_col=2,n_row=2,.title="Multiple Time Series"){
 data %>% 
   select(-all_of(exclude_var)) %>% 
@@ -67,6 +62,19 @@ data %>%
 
 ```
 
+## Single Time Series
+
+```{r}
+plot_time_series(.data=df,
+                 .date_var = date,
+                 .value = ADHK,
+                 .interactive = TRUE,
+                 .title =  "ADHK",
+                 .smooth = FALSE)
+```
+
+### Multiple Plot
+
 ```{r}
 multi_plot_time_series(df,
                        date = "date",
@@ -78,7 +86,7 @@ multi_plot_time_series(df,
 ## Grafik Time Series Differencing
 
 ```{r}
-tk_augment_differences(.data=na.omit(df),
+tk_augment_differences(.data=df,
                         .value = ADHK,
                         .differences = 1) %>% 
   plot_time_series(.date_var = date,
@@ -152,7 +160,7 @@ prepare_mimo_data <- function(data,
 ### Struktur Data MIMO
 
 ```{r}
-prepare_mimo_data(data = na.omit(df),
+prepare_mimo_data(data = df,
                   date_col = date,
                   input_vars = c("ADHK"),
                   output_vars = c("ADHK"),
@@ -173,6 +181,8 @@ train_lstm_mimo <- function(data,
                             output_cols,
                             val_split    = 0.2,
                             epochs       = 50,
+                            patience     = 10,
+                            min_delta    = 1e-4,
                             batch_size   = 32,
                             lr           = 1e-3,
                             optimizer    = c("adam","sgd"),
@@ -273,6 +283,10 @@ train_lstm_mimo <- function(data,
   # 8) Training loop
   train_loss <- numeric(epochs)
   val_loss   <- numeric(epochs)
+
+   # Early stopping state
+   best_loss <- Inf
+    wait      <- 0
   for (e in seq_len(epochs)) {
     model$train()
     optim$zero_grad()
@@ -287,7 +301,22 @@ train_lstm_mimo <- function(data,
       preds_val    <- model(val_ds$x)
       val_loss[e]  <- criterion(preds_val, val_ds$y)$item()
     })
+    # — Early stopping check —
+    if (val_loss[e] < best_loss - min_delta) {
+      best_loss <- val_loss[e]
+      wait      <- 0
+    } else {
+      wait <- wait + 1
+      if (wait >= patience) {
+        message("Stopping early at epoch ", e, 
+                " (no improvement for ", patience, " epochs).")
+        break
+      }
+    }
   }
+  # trim losses if we stopped early
+  train_loss <- train_loss[1:e]
+  val_loss   <- val_loss[1:e]
 
   list(
     model       = model,
@@ -322,6 +351,7 @@ plot_lstm_history <- function(history) {
 }
 ```
 
+
 ```{r}
 #| code-fold: true
 predict_lstm <- function(history, new_data) {
@@ -349,6 +379,111 @@ predict_lstm <- function(history, new_data) {
   tibble(date = dates) %>% bind_cols(pred_df)
 }
 ```
+
+```{r}
+#| code-fold: true
+cross_validate_lstm <- function(data,
+                                date_col,
+                                input_cols,
+                                output_cols,
+                                initial,
+                                assess,
+                                skip,
+                                metric_fun = yardstick::rmse,
+                                ...) {
+  date_col <- rlang::ensym(date_col)
+
+  # 1) generate rolling splits
+  splits <- timetk::time_series_cv(
+    data,
+    date_col   = !!date_col,
+    initial    = initial,
+    assess     = assess,
+    skip       = skip
+  )
+
+  # 2) fit + forecast on each split
+  preds_list <- purrr::map(splits$splits, function(split) {
+    train_data <- rsample::analysis(split)
+    test_data  <- rsample::assessment(split)
+
+    # train on analysis
+    history <- train_lstm_mimo(
+      data        = train_data,
+      date_col    = !!date_col,
+      input_cols  = input_cols,
+      output_cols = output_cols,
+      ...
+    )
+
+    # forecast on assessment
+    pred_tbl <- predict_lstm(history, train_data %>% slice_tail(n=1))
+
+    # align actuals (rename date → date so join works)
+    actual_tbl <- test_data %>%
+      select(!!date_col, all_of(output_cols)) %>%
+      rename(date = !!date_col)
+
+    # pivot if multiple output_cols
+    full_join(actual_tbl, pred_tbl, by = "date")
+  })
+
+  # 3) compute metrics per split
+  metrics_tbl <- purrr::imap_dfr(preds_list, function(df, i) {
+    # df has columns: date, <output_cols> (actual), <output_cols> (forecast)
+    # assume same names for actual and forecast columns
+    # we rename forecasts to .pred internally
+
+    df_long <- df %>%
+      rename_with(~ ".pred", all_of(output_cols))
+
+    res <- metric_fun(
+      df_long,
+      truth    = !!rlang::sym(output_cols),
+      estimate = .pred
+    )
+    res$id <- splits$id[i]
+    res
+  })
+
+  # 4) combine predictions into one tibble
+  preds_tbl <- purrr::imap_dfr(preds_list, function(df, i) {
+    df$id <- splits$id[i]
+    df
+  })
+
+  list(
+    predictions = preds_tbl,
+    metrics     = metrics_tbl
+  )
+}
+
+
+plot_cv_forecasts <- function(cv_res, split = NULL) {
+  df <- cv_res$predictions
+  if (!is.null(split)) {
+    df <- filter(df, id == split)
+  }
+  # pivot into long format
+  df_long <- df %>%
+    pivot_longer(cols = -c(id, date),
+                 names_to  = "series",
+                 values_to = "value")
+
+  ggplot(df_long, aes(x = date, y = value, color = series)) +
+    geom_line() +
+    labs(
+      title = ifelse(is.null(split),
+                     "All Splits: Actual vs Forecast",
+                     paste0("Split ", split, ": Actual vs Forecast")),
+      x     = "Date",
+      y     = "Value",
+      color = NULL
+    ) +
+    theme_minimal()
+}
+```
+
 
 ```{r}
 #| code-fold: true
@@ -429,6 +564,26 @@ output_cols <- names(select(train_df,contains("lead")))
 output_cols
 ```
 
+#### Cross Validation
+
+```{r}
+cv_mod <- cross_validate_lstm(data = train_df,
+                     input_cols = input_cols,
+                     output_cols = output_cols,
+                     date_col = "date_lg0",
+                     val_split = 0.2,
+                     epochs = 1000,
+                     batch_size = nrow(train_df),
+                     optimizer = "adam",
+                     hidden_size = 200,
+                     num_layers = 1,
+                     activation = "linear",
+                     initial = 5,
+                     skip = 1,
+                     assess = 4)
+```
+
+
 
 ```{r}
 mod <- train_lstm_mimo(data = train_df,
@@ -436,10 +591,10 @@ mod <- train_lstm_mimo(data = train_df,
                      output_cols = output_cols,
                      date_col = "date_lg0",
                      val_split = 0.2,
-                     epochs = 75,
-                     batch_size = 32,
+                     epochs = 1000,
+                     batch_size = nrow(train_df),
                      optimizer = "adam",
-                     hidden_size = 10,
+                     hidden_size = 100,
                      num_layers = 1,
                      activation = "linear")
 mod$model
